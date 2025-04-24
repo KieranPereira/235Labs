@@ -1,0 +1,43 @@
+docker run --platform linux/arm64 -it -v /c/Users/kiera/Code/ros2_ws:/ros2_ws ghcr.io/sloretz/ros:humble-ros-core
+
+apt-get update
+apt-get install -y git build-essential cmake python3-colcon-common-extensions
+
+git clone https://github.com/dustinteng/TAFLAB_boatpi_roshumble.git
+cd TAFLAB_boatpi_roshumble/
+git switch python
+
+
+
+
+
+docker run --platform linux/arm64 -it -v /c/Users/kiera/Code/ros2_ws:/ros2_ws everythinginstalled
+
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+  && pip3 install \
+    smbus2 \
+    RPi.GPIO \
+    pyserial \
+    digi-xbee
+
+
+
+
+
+tar czvf ros2_deployment.tar.gz install
+
+docker cp <917602a4b6efbff4a29db12a082091cdd7d41f9aacff33eac2ee108893bf7171>:/ros2_ws/src/TAFLAB_boatpi_roshumble/ros2_deployment.tar.gz C:\Users\kiera\Downloads\ros2_deployment.tar.gz
+
+docker exec -it 77ae29fa399b bash
+
+
+Remoting into boatL:
+ssh boat@10.41.220.176
+sudo -i
+source /opt/ros/humble/setup.bash
+source /home/boatk/TAFLAB_boatpi_roshumble/install/setup.bash
+
+
+
+ros2 run control_py boat_control

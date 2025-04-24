@@ -1,0 +1,7 @@
+-- The C compiler identification is unknown
+-- The CXX compiler identification is unknown
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - failed
+-- Check for working C compiler: C:/msys64/ucrt64/bin/cc.exe
+-- Check for working C compiler: C:/msys64/ucrt64/bin/cc.exe - broken
+-- Configuring incomplete, errors occurred!
