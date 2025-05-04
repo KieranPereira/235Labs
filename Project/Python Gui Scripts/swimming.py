@@ -3,64 +3,144 @@ import os
 import time
 import math
 import re
+import logging
 import serial
+from serial import SerialException
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
-    QSizePolicy, QSlider, QPushButton, QLabel
+    QSlider, QPushButton, QLabel
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import (
     QPainter, QPen, QFont, QPixmap, QImage,
     QPalette, QColor
 )
 from PIL import Image, ImageDraw, ImageChops
 
-# Configuration
-PORT = "COM8"
-BAUD = 115200
-ROLL_THRESHOLD    = 10
-PITCH_THRESHOLD   = 10
-MAX_POINTS        = 1000
-FLASH_DURATION_MS = 200  # ms for quadrant flash
+# ——— Logging setup ———
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
-# Single serial instance for read/write
-ser = serial.Serial(PORT, BAUD, timeout=0.01)
+# Configuration
+PORT               = "COM8"
+BAUD               = 115200
+ROLL_THRESHOLD     = 10
+PITCH_THRESHOLD    = 10
+MAX_POINTS         = 1000
+FLASH_DURATION_MS  = 200   # ms for quadrant flash
+RETRY_DELAY        = 5     # seconds between retry attempts
+
 
 class SerialWorker(QThread):
-    newData = pyqtSignal(float, float, float)  # t, pitch, roll
+    newData     = pyqtSignal(float, float, float)  # t, pitch, roll
+    sendCommand = pyqtSignal(bytes)
 
     def __init__(self, port, baud):
         super().__init__()
+        self.port = port
+        self.baud = baud
         self._running = True
+        self.ser = None
+        self.sendCommand.connect(self.onSend)
+
+    def open_serial(self):
+        """Block until we can open the port, retrying every RETRY_DELAY."""
+        while self._running:
+            try:
+                logger.info(f"Opening serial port {self.port} @ {self.baud}")
+                self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                logger.info("Serial port opened successfully")
+                return
+            except (SerialException, PermissionError, OSError) as e:
+                logger.warning(f"Failed to open {self.port}: {e}. Retrying in {RETRY_DELAY}s")
+                time.sleep(RETRY_DELAY)
+
+    @pyqtSlot(bytes)
+    def onSend(self, data: bytes):
+        """Handle outgoing commands; special-case REBOOT to close port."""
+        if data == b'REBOOT\n':
+            logger.info("→ REBOOT command sent, closing port to allow ESP restart")
+            try:
+                if self.ser and self.ser.is_open:
+                    self.ser.write(data)
+                    logger.debug(f"Sent reboot: {data!r}")
+            except Exception as e:
+                logger.error(f"Error sending reboot: {e}")
+            # close and clear handle; run() will detect next iteration
+            try:
+                if self.ser:
+                    self.ser.close()
+                    logger.debug("Serial port closed for reboot")
+            except Exception as e:
+                logger.error(f"Error closing port for reboot: {e}")
+            self.ser = None
+            return
+
+        # all other commands
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(data)
+                logger.debug(f"Sent command: {data!r}")
+            except SerialException as e:
+                logger.error(f"Error writing to serial: {e}")
 
     def run(self):
-        # 1) timestamp
-        # 2) back.roll
-        # 3) top.pitch
         pattern = re.compile(
             r'^\s*([0-9]+\.[0-9]+),'      # 1) timestamp
-            r'\s*([+-]?\d+(?:\.\d+)?),'   # 2) roll lower back
-            r'\s*([+-]?\d+(?:\.\d+)?)'    # 3) pitch neck
+            r'\s*([+-]?\d+(?:\.\d+)?),'   # 2) roll
+            r'\s*([+-]?\d+(?:\.\d+)?)'    # 3) pitch
         )
 
+        self.open_serial()
+
         while self._running:
-            line = ser.readline().decode('utf-8', 'ignore').strip()
-            m = pattern.match(line)
-            if not m:
+            try:
+                raw = self.ser.readline()
+                line = raw.decode('utf-8', 'ignore').strip()
+            except Exception as e:
+                logger.error(f"Connection lost: {e}. Retrying in {RETRY_DELAY}s")
+                try:
+                    if self.ser:
+                        self.ser.close()
+                        logger.debug("Serial port closed after loss")
+                except:
+                    pass
+                self.ser = None
+                time.sleep(RETRY_DELAY)
+                self.open_serial()
                 continue
 
-            t    = float(m.group(1))
-            roll = float(m.group(2))
-            pitch= float(m.group(3))
+            if not line:
+                continue
 
-            # our GUI slot expects (t, pitch, roll)
+            logger.debug(f"Received line: {line}")
+            m = pattern.match(line)
+            if not m:
+                logger.debug("Line did not match telemetry pattern")
+                continue
+
+            t     = float(m.group(1))
+            roll  = float(m.group(2))
+            pitch = float(m.group(3))
+            logger.debug(f"Parsed data → t:{t}, roll:{roll}, pitch:{pitch}")
             self.newData.emit(t, pitch, roll)
 
     def stop(self):
         self._running = False
+        try:
+            if self.ser:
+                self.ser.close()
+                logger.info("Serial port closed on stop()")
+        except:
+            pass
         self.wait()
+
 
 def make_silhouette_mask(img: Image.Image) -> Image.Image:
     gray   = img.convert("L")
@@ -69,16 +149,17 @@ def make_silhouette_mask(img: Image.Image) -> Image.Image:
     ImageDraw.floodfill(white, (0, 0), 0)
     return ImageChops.add(stroke, white)
 
+
 class HeatmapWidget(QWidget):
     sectionClicked = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, serial_thread, parent=None):
         super().__init__(parent)
-        img_path    = os.path.join(os.path.dirname(__file__), "human_outline.jpg")
-        self.orig   = Image.open(img_path).convert("RGBA")
-        self.mask   = make_silhouette_mask(self.orig)
-        self.roll   = 0.0
-        self.pitch  = 0.0
+        self.serial_thread = serial_thread
+        img_path  = os.path.join(os.path.dirname(__file__), "human_outline.jpg")
+        self.mask  = make_silhouette_mask(Image.open(img_path).convert("RGBA"))
+        self.roll  = 0.0
+        self.pitch = 0.0
         self.flash_section = None
 
     def setAngles(self, roll, pitch):
@@ -89,22 +170,21 @@ class HeatmapWidget(QWidget):
         x, y = event.x(), event.y()
         w, h = self.width(), self.height()
         if x < w/2 and y < h/2:
-            section, msg = 'TL', 'Q1\n'
+            section, msg = 'TL', b'Q1\n'
         elif x >= w/2 and y < h/2:
-            section, msg = 'TR', 'Q2\n'
+            section, msg = 'TR', b'Q2\n'
         elif x < w/2 and y >= h/2:
-            section, msg = 'BL', 'Q3\n'
+            section, msg = 'BL', b'Q3\n'
         else:
-            section, msg = 'BR', 'Q4\n'
-        try:
-            ser.write(msg.encode('utf-8'))
-        except Exception as e:
-            print("Serial write failed:", e)
+            section, msg = 'BR', b'Q4\n'
+
+        logger.info(f"Click in {section}, sending {msg!r}")
+        self.serial_thread.sendCommand.emit(msg)
+
         self.flash_section = section
         QTimer.singleShot(FLASH_DURATION_MS, self.clearFlash)
         self.update()
         self.sectionClicked.emit(section)
-        super().mousePressEvent(event)
 
     def clearFlash(self):
         self.flash_section = None
@@ -113,27 +193,25 @@ class HeatmapWidget(QWidget):
     def paintEvent(self, event):
         painter     = QPainter(self)
         w, h        = self.width(), self.height()
-        mask_scaled = self.mask.resize((w, h), Image.NEAREST)
-        mask_data   = mask_scaled.load()
-
-        out = Image.new("RGBA", (w, h), (0,0,0,0))
-        pix = out.load()
+        mask_data   = self.mask.resize((w, h), Image.NEAREST).load()
+        out         = Image.new("RGBA", (w, h), (0,0,0,0))
+        pix         = out.load()
 
         for yy in range(h):
-            top  = yy < h//2
+            top = yy < h//2
             for xx in range(w):
                 if mask_data[xx, yy] != 255:
                     continue
                 left = xx < w//2
                 if top and left:
-                    value, threshold = -self.roll, ROLL_THRESHOLD
+                    value, thresh = -self.roll, ROLL_THRESHOLD
                 elif top and not left:
-                    value, threshold = self.roll, ROLL_THRESHOLD
+                    value, thresh = self.roll, ROLL_THRESHOLD
                 elif not top and left:
-                    value, threshold = -self.pitch, PITCH_THRESHOLD
+                    value, thresh = -self.pitch, PITCH_THRESHOLD
                 else:
-                    value, threshold = self.pitch, PITCH_THRESHOLD
-                if value > threshold:
+                    value, thresh = self.pitch, PITCH_THRESHOLD
+                if value > thresh:
                     pix[xx, yy] = (255, 0, 0)
 
         data = out.convert("RGBA").tobytes("raw","RGBA")
@@ -151,14 +229,14 @@ class HeatmapWidget(QWidget):
             }
             painter.fillRect(*rects[self.flash_section], overlay)
 
+
 class AngleHistoryWidget(QWidget):
     def __init__(self, label, color, threshold, parent=None):
         super().__init__(parent)
         self.label, self.color, self.threshold = label, color, threshold
         self.size = 300
         self.center = self.size // 2
-        self.length = 200
-        self.half = self.length / 2
+        self.half = self.size // 2
         self.value = 0.0
         self.setFixedSize(self.size, self.size)
 
@@ -172,28 +250,29 @@ class AngleHistoryWidget(QWidget):
         painter.setPen(QColor(200,200,200))
         painter.setFont(QFont("Arial",16))
         painter.drawText(self.center-30,30,self.label)
-
         rad = math.radians(self.value)
         dx = self.half * math.cos(rad)
         dy = self.half * math.sin(rad)
         x1, y1 = self.center-dx, self.center+dy
         x2, y2 = self.center+dx, self.center-dy
-
         painter.setPen(QPen(self.color,4))
         painter.drawLine(int(x1),int(y1),int(x2),int(y2))
-
-        tex_color = Qt.red if abs(self.value) > self.threshold else QColor(220,220,220)
-        painter.setPen(QPen(tex_color))
+        c = QColor(220,0,0) if abs(self.value)>self.threshold else QColor(220,220,220)
+        painter.setPen(QPen(c))
         painter.setFont(QFont("Arial",12))
-        painter.drawText(self.center-20,self.size-20,f"{self.value:.1f}°")
+        painter.drawText(self.center-20,self.size-20,f"{self.value:.1f}°")    
+
 
 class LeftPanel(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, serial_thread, parent=None):
         super().__init__(parent)
+        self.serial_thread = serial_thread
+
         self.roll_display  = AngleHistoryWidget("Roll", Qt.cyan,   ROLL_THRESHOLD)
         self.pitch_display = AngleHistoryWidget("Pitch",Qt.magenta,PITCH_THRESHOLD)
         self.slider        = QSlider(Qt.Horizontal)
         self.time_label    = QLabel("0.0 s")
+        self.status_label  = QLabel("Status: Disconnected")
         self.sync_button   = QPushButton("Sync to Live")
         self.reboot_button = QPushButton("Reboot")
 
@@ -206,46 +285,42 @@ class LeftPanel(QWidget):
         bottom = QHBoxLayout()
         bottom.addWidget(self.slider)
         bottom.addWidget(self.time_label)
-        
+        bottom.addWidget(self.status_label)
         bottom.addWidget(self.sync_button)
         bottom.addWidget(self.reboot_button)
-
 
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addLayout(bottom)
 
         self.time_data, self.roll_data, self.pitch_data = [], [], []
+        self.last_data_time = 0
         self.follow = True
+        self.slider.sliderPressed.connect(lambda: setattr(self, 'follow', False))
 
-        self.slider.sliderPressed.connect(self.on_slider_pressed)
-
-    def on_slider_pressed(self):
-        self.follow = False
+        # status checker
+        self.check_timer = QTimer(self)
+        self.check_timer.timeout.connect(self.check_status)
+        self.check_timer.start(1000)
 
     def sync_to_live(self):
         if self.time_data:
-            self.slider.setMaximum(len(self.time_data)-1)
+            self.slider.setRange(0, len(self.time_data)-1)
             self.slider.setValue(self.slider.maximum())
             self.follow = True
 
     def sendReboot(self):
-        try:
-            ser.write(b'REBOOT\n')
-        except Exception as e:
-            print("Failed to send reboot:", e)
+        logger.info("GUI → sending REBOOT")
+        self.serial_thread.sendCommand.emit(b'REBOOT\n')
 
-    # def sendStop(self):
-    #     try:
-    #         ser.write(b'STOP\n')
-    #     except Exception as e:
-    #         print("Failed to send stop:", e)
-
-    @QtCore.pyqtSlot(float, float, float)
+    @pyqtSlot(float, float, float)
     def onSerialData(self, t, pitch, roll):
+        logger.debug(f"GUI received data: t={t}, pitch={pitch}, roll={roll}")
         self.time_data.append(t)
         self.pitch_data.append(pitch)
         self.roll_data.append(roll)
+        self.last_data_time = time.time()
+        self.status_label.setText("Status: Live")
 
         if len(self.time_data) > MAX_POINTS:
             self.time_data.pop(0)
@@ -253,12 +328,14 @@ class LeftPanel(QWidget):
             self.roll_data.pop(0)
 
         cnt = len(self.time_data)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(cnt - 1)
+        self.slider.setRange(0, cnt-1)
         if self.follow:
-            self.slider.setValue(cnt - 1)
-
+            self.slider.setValue(cnt-1)
         self.redraw()
+
+    def check_status(self):
+        if time.time() - self.last_data_time > RETRY_DELAY:
+            self.status_label.setText("Status: No Data")
 
     def redraw(self):
         idx = self.slider.value()
@@ -267,14 +344,16 @@ class LeftPanel(QWidget):
             self.pitch_display.setValue(self.pitch_data[idx])
             self.time_label.setText(f"{self.time_data[idx]:.1f} s")
 
+
 class SwimMonitor(QWidget):
-    def __init__(self):
+    def __init__(self, serial_thread):
         super().__init__()
+        self.serial_thread = serial_thread
         self.setWindowTitle("Swim Form Monitor")
         self.resize(900, 400)
 
-        self.left_panel = LeftPanel()
-        self.heatmap    = HeatmapWidget()
+        self.left_panel = LeftPanel(serial_thread, parent=self)
+        self.heatmap    = HeatmapWidget(serial_thread, parent=self)
 
         layout = QHBoxLayout(self)
         layout.addWidget(self.left_panel, 1)
@@ -292,9 +371,12 @@ class SwimMonitor(QWidget):
             roll, pitch = 0, 0
         self.heatmap.setAngles(roll, pitch)
 
+
 if __name__ == "__main__":
-    # Dark theme setup
+    logger.info("Starting application")
     app = QApplication(sys.argv)
+
+    # Dark theme
     dark = QPalette()
     dark.setColor(QPalette.Window,        QColor(53, 53, 53))
     dark.setColor(QPalette.WindowText,    Qt.white)
@@ -307,15 +389,16 @@ if __name__ == "__main__":
     dark.setColor(QPalette.HighlightedText, Qt.black)
     app.setPalette(dark)
 
-    # Main window and serial thread
-    window = SwimMonitor()
+    ser_thread = SerialWorker(PORT, BAUD)
+    ser_thread.start()
+    logger.info("SerialWorker thread started")
+
+    window = SwimMonitor(ser_thread)
     window.show()
 
-    ser_thread = SerialWorker(PORT, BAUD)
     ser_thread.newData.connect(window.left_panel.onSerialData)
-    ser_thread.start()
 
-    exit_code = app.exec_()
+    ret = app.exec_()
     ser_thread.stop()
-    sys.exit(exit_code)
-
+    logger.info("Application exiting")
+    sys.exit(ret)
