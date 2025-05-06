@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "MPU6050.h"
-#include <BluetoothSerial.h>
+#include <BleSerial.h>
 #include <esp_system.h>    // for ESP.restart()
 
 // SD card includes
@@ -31,7 +31,7 @@ static TaskHandle_t imuNeckHandle   = NULL;
 static SemaphoreHandle_t i2cMutex;
 static SemaphoreHandle_t sdMutex;
 // Bluetooth Serial
-static BluetoothSerial SerialBT;
+static BleSerial SerialBLE;
 
 // Compile‐time toggle: true = two IMUs, false = single IMU
 static constexpr bool TWO_IMUS = true;
@@ -101,7 +101,7 @@ void taskTelemetry(void* pv);
 void setup() {
   // Serial + Bluetooth
   Serial.begin(115200);
-  SerialBT.begin("ESP32_Vibro_real");
+  SerialBLE.begin("ESP32_Vibro_new");
   Serial.println("Bluetooth ready to pair");
 
   // LED
@@ -277,14 +277,14 @@ void taskIMUTop(void* pv) {
 void taskCommand(void* pv) {
   for (;;) {
     
-    if (SerialBT.available()) 
+    if (SerialBLE.available()) 
     {
-      String s = SerialBT.readStringUntil('\n');
+      String s = SerialBLE.readStringUntil('\n');
       s.trim();
 
       //  ─────────────── Reboot command ───────────────
       if (s == "REBOOT") {
-        SerialBT.println("Rebooting now...");
+        SerialBLE.println("Rebooting now...");
         vTaskDelay(pdMS_TO_TICKS(50));    // give time to flush
         ESP.restart();                    // reset the ESP32
       }
@@ -336,7 +336,7 @@ void taskTelemetry(void* pv) {
     // check for commands
     if (xQueueReceive(cmdQueue, &cmd, 0)==pdPASS) {
       Serial.printf("CMD RECEIVED: %d\n", cmd);
-      SerialBT.printf("CMD RECEIVED: %d\n", cmd);
+      SerialBLE.printf("CMD RECEIVED: %d\n", cmd);
     }
 
     // log both IMUs together (optional) and stream live CSV
@@ -359,7 +359,7 @@ void taskTelemetry(void* pv) {
         f.close();
       }
 
-    SerialBT.printf(
+      SerialBLE.printf(
       "%0.3f,%.1f,%.1f\n",
       t_s,
       back.roll,
