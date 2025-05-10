@@ -1,22 +1,11 @@
-import sys
-import os
-import time
-import math
-import re
-import logging
-import serial
-from serial import SerialException
-
+import sys, os, time, math, re, logging, socket, queue
 from PyQt5 import QtCore
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
     QSlider, QPushButton, QLabel
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot
-from PyQt5.QtGui import (
-    QPainter, QPen, QFont, QPixmap, QImage,
-    QPalette, QColor
-)
+from PyQt5.QtGui import QPainter, QPen, QFont, QPixmap, QImage, QPalette, QColor
 from PIL import Image, ImageDraw, ImageChops
 
 # ——— Logging setup ———
@@ -26,9 +15,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
 # ——— Configuration ———
-PORT               = "COM8"     # serial port for your ESP32
+
 BAUD               = 115200     # your ESP32 baud rate
 ROLL_THRESHOLD     = 10         # tilt beyond which top zones light up
 PITCH_THRESHOLD    = 10         # tilt beyond which bottom zones light up
@@ -36,96 +24,65 @@ MAX_POINTS         = 1000       # how many history points to keep
 FLASH_DURATION_MS  = 200        # how long the clicked quadrant flashes
 RETRY_DELAY        = 5          # seconds between serial‐retry attempts
 
-class SerialWorker(QThread):
+
+# near the top of your file, before BLEWorker
+pattern = re.compile(
+    r'^\s*([0-9]+\.[0-9]+),'      # timestamp
+    r'\s*([+-]?\d+(?:\.\d+)?),'   # roll
+    r'\s*([+-]?\d+(?:\.\d+)?)'    # pitch
+)
+
+
+
+class TCPWorker(QThread):
     newData     = pyqtSignal(float, float, float)
-    sendCommand = pyqtSignal(bytes)
+    sendCommand = pyqtSignal(str)
 
-    def __init__(self, port, baud):
+    def __init__(self, host: str, port: int):
         super().__init__()
-        self.port, self.baud = port, baud
-        self._running = True
-        self.ser = None
-        self.sendCommand.connect(self.onSend)
-
-    def open_serial(self):
-        while self._running:
-            try:
-                logger.info(f"Opening serial port {self.port} @ {self.baud}")
-                self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
-                logger.info("Serial port opened successfully")
-                return
-            except (SerialException, PermissionError, OSError) as e:
-                logger.warning(f"Failed to open {self.port}: {e}. Retrying in {RETRY_DELAY}s")
-                time.sleep(RETRY_DELAY)
-
-    @pyqtSlot(bytes)
-    def onSend(self, data: bytes):
-        if data == b'REBOOT\n':
-            try:
-                if self.ser and self.ser.is_open:
-                    self.ser.write(data)
-                    logger.debug(f"Sent reboot: {data!r}")
-            except Exception as e:
-                logger.error(f"Error sending reboot: {e}")
-            try:
-                if self.ser:
-                    self.ser.close()
-                    logger.debug("Serial port closed for reboot")
-            except Exception as e:
-                logger.error(f"Error closing port for reboot: {e}")
-            self.ser = None
-            return
-
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(data)
-                logger.debug(f"Sent command: {data!r}")
-            except SerialException as e:
-                logger.error(f"Error writing to serial: {e}")
+        self.host      = host
+        self.port      = port
+        self.cmd_queue = queue.Queue()
+        self.sendCommand.connect(lambda cmd: self.cmd_queue.put(cmd))
 
     def run(self):
-        pattern = re.compile(
-            r'^\s*([0-9]+\.[0-9]+),'      # 1) timestamp
-            r'\s*([+-]?\d+(?:\.\d+)?),'   # 2) roll
-            r'\s*([+-]?\d+(?:\.\d+)?)'    # 3) pitch
-        )
-
-        self.open_serial()
-        while self._running:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        while True:
             try:
-                raw = self.ser.readline()
-                line = raw.decode('utf-8', 'ignore').strip()
-            except Exception as e:
-                logger.error(f"Connection lost: {e}. Retrying in {RETRY_DELAY}s")
-                try: self.ser.close()
-                except: pass
-                self.ser = None
+                sock.connect((self.host, self.port))
+                logger.info(f"TCP connected to {self.host}:{self.port}")
+                break
+            except OSError:
+                logger.warning(f"TCP connect failed, retry in {RETRY_DELAY}s")
                 time.sleep(RETRY_DELAY)
-                self.open_serial()
-                continue
 
-            if not line:
-                continue
+        sock.setblocking(False)
+        buf = ""
+        while True:
+            # send queued commands
+            try:
+                cmd = self.cmd_queue.get_nowait()
+                sock.sendall(cmd.encode())
+                logger.debug(f"Sent command: {cmd.strip()}")
+            except queue.Empty:
+                pass
 
-            logger.debug(f"Received line: {line}")
-            m = pattern.match(line)
-            if not m:
-                logger.debug("Line did not match telemetry pattern")
-                continue
+            # receive telemetry
+            try:
+                data = sock.recv(1024).decode('utf-8', 'ignore')
+                if data:
+                    buf += data
+                    while '\n' in buf:
+                        line, buf = buf.split('\n', 1)
+                        m = pattern.match(line.strip())
+                        if m:
+                            t, roll, pitch = map(float, m.groups())
+                            self.newData.emit(t, pitch, roll)
+            except BlockingIOError:
+                pass
 
-            t, roll, pitch = map(float, m.groups())
-            logger.debug(f"Parsed data → t:{t}, roll:{roll}, pitch:{pitch}")
-            self.newData.emit(t, pitch, roll)
+            time.sleep(0.01)
 
-    def stop(self):
-        self._running = False
-        try:
-            if self.ser:
-                self.ser.close()
-                logger.info("Serial port closed on stop()")
-        except:
-            pass
-        self.wait()
 
 
 def make_silhouette_mask(img: Image.Image) -> Image.Image:
@@ -164,13 +121,13 @@ class HeatmapWidget(QWidget):
         half_w  = w // 2
 
         if y < top_mid:
-            section, msg = 'T1', b'Q1\n'
+            section, msg = 'T1', 'Q1\n'
         elif y < neck_y:
-            section, msg = 'T2', b'Q2\n'
+            section, msg = 'T2', 'Q2\n'
         elif x < half_w:
-            section, msg = 'BL', b'Q3\n'
+            section, msg = 'BL', 'Q3\n'
         else:
-            section, msg = 'BR', b'Q4\n'
+            section, msg = 'BR', 'Q4\n'
 
         logger.info(f"Click in {section}, sending {msg!r}")
         self.serial_thread.sendCommand.emit(msg)
@@ -326,7 +283,7 @@ class LeftPanel(QWidget):
 
     def sendReboot(self):
         logger.info("GUI → sending REBOOT")
-        self.serial_thread.sendCommand.emit(b'REBOOT\n')
+        self.serial_thread.sendCommand.emit('REBOOT\n')
 
     @pyqtSlot(float, float, float)
     def onSerialData(self, t, pitch, roll):
@@ -391,7 +348,7 @@ if __name__ == "__main__":
     logger.info("Starting application")
     app = QApplication(sys.argv)
 
-    # Dark theme palette
+    # Dark theme palette (same as before)
     dark = QPalette()
     dark.setColor(QPalette.Window,        QColor(53, 53, 53))
     dark.setColor(QPalette.WindowText,    Qt.white)
@@ -404,7 +361,6 @@ if __name__ == "__main__":
     dark.setColor(QPalette.HighlightedText, Qt.black)
     app.setPalette(dark)
 
-    # Global button styling to match dark theme
     app.setStyleSheet("""
         QPushButton {
             background-color: #353535;
@@ -421,22 +377,16 @@ if __name__ == "__main__":
         }
     """)
 
-    # Start serial thread
-    ser_thread = SerialWorker(PORT, BAUD)
-    ser_thread.start()
-    logger.info("SerialWorker thread started")
+    # ——— Start TCP thread instead of BLE ———
+    tcp_thread = TCPWorker("192.168.4.1", 3333)
+    tcp_thread.start()
 
-    # Create and show main window
-    window = SwimMonitor(ser_thread)
+    window = SwimMonitor(tcp_thread)
+    tcp_thread.newData.connect(window.left_panel.onSerialData)
+
     window.show()
-
-    # Connect incoming data to GUI
-    ser_thread.newData.connect(window.left_panel.onSerialData)
-
-    # Enter Qt main loop
     ret = app.exec_()
 
-    # Clean up
-    ser_thread.stop()
+    tcp_thread.wait()  # clean up
     logger.info("Application exiting")
     sys.exit(ret)
