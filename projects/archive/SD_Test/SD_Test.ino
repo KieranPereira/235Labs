@@ -1,243 +1,63 @@
 /*
- * pin 1 - not used          |  Micro SD card     |
- * pin 2 - CS (SS)           |                   /
- * pin 3 - DI (MOSI)         |                  |__
- * pin 4 - VDD (3.3V)        |                    |
- * pin 5 - SCK (SCLK)        | 8 7 6 5 4 3 2 1   /
- * pin 6 - VSS (GND)         | ▄ ▄ ▄ ▄ ▄ ▄ ▄ ▄  /
- * pin 7 - DO (MISO)         | ▀ ▀ █ ▀ █ ▀ ▀ ▀ |
- * pin 8 - not used          |_________________|
- *
- * SPI Pin Name | ESP32 Feather GPIO
- * CS (SS)      | GPIO5
- * DI (MOSI)    | GPIO23
- * DO (MISO)    | GPIO19
- * SCK (SCLK)   | GPIO18
- */
+   Simple MPU6050 poll – no external libraries
+   ESP32 Feather pins:
+     SDA = GPIO 22
+     SCL = GPIO 20
+   Sensor address 0x68 (AD0 LOW)
+*/
 
-#include "FS.h"
-#include "SD.h"
-#include "SPI.h"
+#include <Wire.h>
 
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
-  Serial.printf("Listing directory: %s\n", dirname);
+constexpr uint8_t SDA_PIN = 22;
+constexpr uint8_t SCL_PIN = 20;
+constexpr uint8_t MPU_ADDR = 0x68;
 
-  File root = fs.open(dirname);
-  if (!root) {
-    Serial.println("Failed to open directory");
-    return;
-  }
-  if (!root.isDirectory()) {
-    Serial.println("Not a directory");
-    return;
-  }
+// MPU6050 register addresses
+constexpr uint8_t PWR_MGMT_1 = 0x68;
+constexpr uint8_t ACCEL_XOUT_H = 0x3B;
 
-  File file = root.openNextFile();
-  while (file) {
-    if (file.isDirectory()) {
-      Serial.print("  DIR : ");
-      Serial.println(file.name());
-      if (levels) {
-        listDir(fs, file.path(), levels - 1);
-      }
-    } else {
-      Serial.print("  FILE: ");
-      Serial.print(file.name());
-      Serial.print("  SIZE: ");
-      Serial.println(file.size());
-    }
-    file = root.openNextFile();
-  }
-}
-
-void createDir(fs::FS &fs, const char *path) {
-  Serial.printf("Creating Dir: %s\n", path);
-  if (fs.mkdir(path)) {
-    Serial.println("Dir created");
-  } else {
-    Serial.println("mkdir failed");
-  }
-}
-
-void removeDir(fs::FS &fs, const char *path) {
-  Serial.printf("Removing Dir: %s\n", path);
-  if (fs.rmdir(path)) {
-    Serial.println("Dir removed");
-  } else {
-    Serial.println("rmdir failed");
-  }
-}
-
-void readFile(fs::FS &fs, const char *path) {
-  Serial.printf("Reading file: %s\n", path);
-
-  File file = fs.open(path);
-  if (!file) {
-    Serial.println("Failed to open file for reading");
-    return;
-  }
-
-  Serial.print("Read from file: ");
-  while (file.available()) {
-    Serial.write(file.read());
-  }
-  file.close();
-}
-
-void writeFile(fs::FS &fs, const char *path, const char *message) {
-  Serial.printf("Writing file: %s\n", path);
-
-  File file = fs.open(path, FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-  if (file.print(message)) {
-    Serial.println("File written");
-  } else {
-    Serial.println("Write failed");
-  }
-  file.close();
-}
-
-void appendFile(fs::FS &fs, const char *path, const char *message) {
-  Serial.printf("Appending to file: %s\n", path);
-
-  File file = fs.open(path, FILE_APPEND);
-  if (!file) {
-    Serial.println("Failed to open file for appending");
-    return;
-  }
-  if (file.print(message)) {
-    Serial.println("Message appended");
-  } else {
-    Serial.println("Append failed");
-  }
-  file.close();
-}
-
-void renameFile(fs::FS &fs, const char *path1, const char *path2) {
-  Serial.printf("Renaming file %s to %s\n", path1, path2);
-  if (fs.rename(path1, path2)) {
-    Serial.println("File renamed");
-  } else {
-    Serial.println("Rename failed");
-  }
-}
-
-void deleteFile(fs::FS &fs, const char *path) {
-  Serial.printf("Deleting file: %s\n", path);
-  if (fs.remove(path)) {
-    Serial.println("File deleted");
-  } else {
-    Serial.println("Delete failed");
-  }
-}
-
-void testFileIO(fs::FS &fs, const char *path) {
-  File file = fs.open(path);
-  static uint8_t buf[512];
-  size_t len = 0;
-  uint32_t start = millis();
-  uint32_t end = start;
-  if (file) {
-    len = file.size();
-    size_t flen = len;
-    start = millis();
-    while (len) {
-      size_t toRead = len > sizeof(buf) ? sizeof(buf) : len;
-      file.read(buf, toRead);
-      len -= toRead;
-    }
-    end = millis() - start;
-    Serial.printf("%u bytes read for %lums\n", flen, end);
-    file.close();
-  } else {
-    Serial.println("Failed to open file for reading");
-  }
-
-  file = fs.open(path, FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-
-  start = millis();
-  for (size_t i = 0; i < 2048; i++) {
-    file.write(buf, sizeof(buf));
-  }
-  end = millis() - start;
-  Serial.printf("%u bytes written for %lums\n", 2048 * sizeof(buf), end);
-  file.close();
-}
-
-void setup() {
+void setup()
+{
   Serial.begin(115200);
+  while (!Serial) { }
 
-#ifdef REASSIGN_PINS
-  SPI.begin(sck, miso, mosi, cs);
-  if (!SD.begin(cs)) {
-#else
-  if (!SD.begin()) {
-#endif
-    Serial.println("Card Mount Failed");
-    return;
-  }
-  uint8_t cardType = SD.cardType();
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);          // 100 kHz for robustness
 
-  if (cardType == CARD_NONE) {
-    Serial.println("No SD card attached");
-    return;
+  // wake up the MPU6050 (clear SLEEP bit)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("ERROR: no ACK at 0x68 – check wiring");
+    while (1) { delay(1000); }
   }
 
-  Serial.print("SD Card Type: ");
-  if (cardType == CARD_MMC) {
-    Serial.println("MMC");
-  } else if (cardType == CARD_SD) {
-    Serial.println("SDSC");
-  } else if (cardType == CARD_SDHC) {
-    Serial.println("SDHC");
-  } else {
-    Serial.println("UNKNOWN");
-  }
-
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  Serial.printf("SD Card Size: %lluMB\n", cardSize);
-
-  listDir(SD, "/", 0);
-  createDir(SD, "/mydir");
-  listDir(SD, "/", 0);
-  removeDir(SD, "/mydir");
-  listDir(SD, "/", 2);
-  writeFile(SD, "/hello.txt", "Hello ");
-  appendFile(SD, "/hello.txt", "World!\n");
-  readFile(SD, "/hello.txt");
-  deleteFile(SD, "/foo.txt");
-  renameFile(SD, "/hello.txt", "/foo.txt");
-  readFile(SD, "/foo.txt");
-  testFileIO(SD, "/test.txt");
-  Serial.printf("Total space: %lluMB\n", SD.totalBytes() / (1024 * 1024));
-  Serial.printf("Used space: %lluMB\n", SD.usedBytes() / (1024 * 1024));
-
-  // --- CSV creation ---
-  // Create and initialize a CSV file on the SD card
-  const char *csvPath = "/data.csv";
-  // Delete if it exists, so we start fresh
-  if (SD.exists(csvPath)) {
-    SD.remove(csvPath);
-  }
-  File csv = SD.open(csvPath, FILE_WRITE);
-  if (csv) {
-    // Write header line
-    csv.println("id,value1,value2,value3");
-    csv.close();
-    Serial.println("✅ CSV file created: /data.csv");
-  } else {
-    Serial.println("❌ Failed to create CSV file");
-  }
-  // --- end CSV creation ---
+  Serial.println("MPU6050 awake – streaming raw accel/gyro…");
 }
 
-void loop() {
-  // Intentionally left empty
+void loop()
+{
+  uint8_t buf[14];
+
+  // burst‑read 14 bytes starting at ACCEL_XOUT_H
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(ACCEL_XOUT_H);
+  Wire.endTransmission(false);                   // restart
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14);
+
+  for (int i = 0; i < 14 && Wire.available(); ++i)
+    buf[i] = Wire.read();
+
+  // unpack big‑endian 16‑bit signed integers
+  int16_t ax = buf[0]  << 8 | buf[1];
+  int16_t ay = buf[2]  << 8 | buf[3];
+  int16_t az = buf[4]  << 8 | buf[5];
+  int16_t gx = buf[8]  << 8 | buf[9];
+  int16_t gy = buf[10] << 8 | buf[11];
+  int16_t gz = buf[12] << 8 | buf[13];
+
+  Serial.printf("ACC (raw): %6d %6d %6d  |  GYRO (raw): %6d %6d %6d\n",
+                ax, ay, az, gx, gy, gz);
+
+  delay(500);
 }

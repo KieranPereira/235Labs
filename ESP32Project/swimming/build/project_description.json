@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "swimming",
-    "project_version":    "5d25e7d-dirty",
+    "project_version":    "ceec8b5-dirty",
     "project_path":       "C:/Users/kiera/Code/235Labs/ESP32Project/swimming",
     "idf_path":           "C:/Users/kiera/esp/v5.4/esp-idf",
     "build_dir":          "C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build",

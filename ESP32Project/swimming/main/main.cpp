@@ -46,6 +46,7 @@ constexpr ledc_channel_t CH_NECK_R = LEDC_CHANNEL_3;
 /* ─── App parameters ──────────────────────────────────────────── */
 
 constexpr float TH_ROLL  = 15.0f;          // deg threshold
+constexpr float TH_PITCH = 10.0f;          // deg threshold
 constexpr uint32_t PWM_DUTY = 150;         // 0‑255 (8‑bit)
 
 /* ───── data structures ─────────────────────────────────────────── */
@@ -155,9 +156,13 @@ static void ledc_init()
     /* create *named* structs so we have l‑values */
     ledc_channel_config_t chL = make_ch(BACK_L_PWM, CH_BACK_L);
     ledc_channel_config_t chR = make_ch(BACK_R_PWM, CH_BACK_R);
+    ledc_channel_config_t chUp  = make_ch(NECK_UP_PWM, CH_NECK_L);
+    ledc_channel_config_t chDn  = make_ch(NECK_DN_PWM, CH_NECK_R);
 
     ESP_ERROR_CHECK(ledc_channel_config(&chL));
     ESP_ERROR_CHECK(ledc_channel_config(&chR));
+    ESP_ERROR_CHECK(ledc_channel_config(&chUp));
+    ESP_ERROR_CHECK(ledc_channel_config(&chDn));
 }
 
 /* ---------- common math helper ---------- */
@@ -212,20 +217,46 @@ static void taskIMUBack(void*)
 }
 
 /* ---------- Neck IMU task ---------- */
+/* ---------- Neck IMU task with thresholding ---------- */
 static void taskIMUNeck(void*)
 {
     if (!imu_neck) {
         ESP_LOGW("NECK","No handle – task suspended");
         vTaskDelete(nullptr);
     }
+
     SensorData d{};
     mpu6050_acce_value_t a;
+
     for (;;)
     {
         if (mpu6050_get_acce(imu_neck, &a) == ESP_OK) {
+
             acce_to_angles(a, d.roll, d.pitch);
             xQueueSend(sensorQueueNeck, &d, 0);
+
+            /* ---- pitch‑based motor drive ---- */
+            if      (d.pitch >  TH_PITCH) {   // tip head UP
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, PWM_DUTY);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
+            }
+            else if (d.pitch < -TH_PITCH) {   // tip head DOWN
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, PWM_DUTY);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
+            }
+            else {                            // within dead‑band
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, 0);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
+            }
+
             ESP_LOGI("NECK","Roll %+6.1f  Pitch %+6.1f", d.roll, d.pitch);
+
         } else {
             ESP_LOGE("NECK","I2C read fail");
         }

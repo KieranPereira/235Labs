@@ -295,9 +295,11 @@ void setup() {
       SD.remove("/datalog.csv");
     }
 
-    File hdr = SD.open("/datalog.csv", FILE_WRITE);
-    hdr.println("time,pitch lower back,roll lower back,pitch neck,roll neck");
-    hdr.close();
+  // Create a new file and write the header
+  File hdr = SD.open("/datalog.csv", FILE_WRITE);
+  hdr.println("time,roll_lower_back,pitch_upper_neck");
+  hdr.close();
+
     
     xSemaphoreGive(sdMutex);
   }
@@ -330,12 +332,27 @@ void loop() {
   delay(1000);
 }
 
+float unwrapDeg(float rawDeg)
+{
+    static float prev = 0;               // keeps state across calls
+    float diff = rawDeg - prev;
+
+    if      (diff >  180.0f) rawDeg -= 360.0f;
+    else if (diff < -180.0f) rawDeg += 360.0f;
+
+    prev = rawDeg;
+    return rawDeg;
+}
+
 
 // ============================ Task Definitions ===========================
 
 void taskIMUBack(void* pv) {
   SensorData data;
   uint32_t cmdVal;
+
+
+
   for (;;) {
     // handle override commands
     if ( xTaskNotifyWait(0, 0xFFFFFFFF, &cmdVal, 0) == pdTRUE ) {
@@ -365,25 +382,24 @@ void taskIMUBack(void* pv) {
     xSemaphoreGive(i2cMutex);
 
     // raw:
-    float rawRoll  = atan2f(-ay, -az) * 57.2958f;
+    float rawRoll  = atan2f(ay, az) * 57.2958f;
     float rawPitch = atan2f(ax, sqrtf(ay*ay + az*az)) * 57.2958f;
 
     #if DISABLE_FILTERS
-      data.roll = rawRoll;
+      data.roll = rawRoll - 178.0f;
       data.pitch = rawPitch;
     #else
       // 1) low-pass
-      float smoothRoll  = lpBackRoll.filter(rawRoll);
+      float smoothRoll  = lpBackRoll.filter(roll);
       float smoothPitch = lpBackPitch.filter(rawPitch);
 
       // 2) Kalman
       data.roll  = kalmanBackRoll.update(smoothRoll);
       data.pitch = kalmanBackPitch.update(smoothPitch);
     #endif
-    
     // check for threshold crossing
-    if      (data.roll >  TH_ROLL) ledcWrite(CH_BACK_R, PWM_DUTY), ledcWrite(CH_BACK_L, 0);
-    else if (data.roll < -TH_ROLL) ledcWrite(CH_BACK_L, PWM_DUTY), ledcWrite(CH_BACK_R, 0);
+    if      (data.roll <  -TH_ROLL) ledcWrite(CH_BACK_R, PWM_DUTY), ledcWrite(CH_BACK_L, 0);
+    else if (data.roll < -300) ledcWrite(CH_BACK_L, PWM_DUTY), ledcWrite(CH_BACK_R, 0);
     else                            ledcWrite(CH_BACK_L, 0),         ledcWrite(CH_BACK_R, 0);
 
 
@@ -429,7 +445,7 @@ void taskIMUTop(void* pv) {
     #if DISABLE_FILTERS
     // pass raw angles straight through
       data.roll  = rawRoll;
-      data.pitch = rawPitch;
+      data.pitch = rawPitch - 8.8f;
     #else
       float smoothRoll  = lpNeckRoll.filter(rawRoll);
       float smoothPitch = lpNeckPitch.filter(rawPitch);
@@ -464,11 +480,25 @@ void taskTelemetry(void* pv) {
         neckPitch = top.pitch;
 
     // only stream once we have both numbers
-    if (!isnan(backRoll) && !isnan(neckPitch) && telemetryClient && telemetryClient.connected()) {
+    if (!isnan(backRoll) && !isnan(neckPitch)) {
         float t = millis() / 1000.0f;
-        int len = snprintf(buf, sizeof(buf), "%0.3f,%.1f,%.1f\n",
-                           t, backRoll, neckPitch);
-        telemetryClient.write((uint8_t*)buf, len);
+
+        // ---------- SD card ----------
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        File f = SD.open("/datalog.csv", FILE_APPEND);
+        if (f) {
+            f.printf("%0.3f,%.1f,%.1f\n", t, backRoll, neckPitch);
+            f.close();           // small file, close every write
+        }
+        xSemaphoreGive(sdMutex);
+
+        // ---------- TCP stream ----------
+        if (telemetryClient && telemetryClient.connected()) {
+            char buf[48];
+            int len = snprintf(buf, sizeof(buf), "%0.3f,%.1f,%.1f\n",
+                              t, backRoll, neckPitch);
+            telemetryClient.write((uint8_t*)buf, len);
+        }
     }
 
     // look for a new client if none is connected
@@ -477,9 +507,12 @@ void taskTelemetry(void* pv) {
         if (nc) telemetryClient = nc;
     }
 
+
+
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
+
 // ============================ Command Processing ===========================
 
 // Parse Serial/BT commands and toggle the LED
@@ -519,8 +552,12 @@ void taskCommand(void* pv) {
         // also log it for telemetry and ack back to GUI
         xQueueSend(cmdQueue, &c, portMAX_DELAY);
         telemetryClient.printf("ACK:%s\n", s.c_str());
+
+
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
+
