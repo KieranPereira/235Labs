@@ -81,4 +81,5 @@ C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/perfmon/libperfm
 C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/rt/librt.a
 C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/spiffs/libspiffs.a
 C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/wifi_provisioning/libwifi_provisioning.a
+C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/espressif__mpu6050/libespressif__mpu6050.a
 C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/main/libmain.a

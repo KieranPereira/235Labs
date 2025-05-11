@@ -549,6 +549,11 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
+  include("C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/espressif__mpu6050/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
   include("C:/Users/kiera/Code/235Labs/ESP32Project/swimming/build/esp-idf/main/cmake_install.cmake")
 endif()
 
