@@ -12,6 +12,12 @@
 
 #include "driver/i2c.h"
 #include "driver/ledc.h"
+#include "driver/gpio.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include <strings.h>
 
 #include "esp_log.h"
 #include <freertos/FreeRTOS.h>
@@ -39,7 +45,7 @@ extern "C" {
 constexpr gpio_num_t SDA_PIN = GPIO_NUM_22;
 constexpr gpio_num_t SCL_PIN = GPIO_NUM_20;
 constexpr i2c_port_t I2C_PORT = I2C_NUM_0;
-constexpr TickType_t SAMPLE_MS = 500;
+constexpr TickType_t SAMPLE_MS = 10;
 
 /* ───── PWM pins ──────────────────────────────────────────────── */
 
@@ -50,8 +56,8 @@ static constexpr int NECK_DN_PWM = 4;
 
 constexpr ledc_channel_t CH_BACK_L = LEDC_CHANNEL_0;
 constexpr ledc_channel_t CH_BACK_R = LEDC_CHANNEL_1;
-constexpr ledc_channel_t CH_NECK_L = LEDC_CHANNEL_2;
-constexpr ledc_channel_t CH_NECK_R = LEDC_CHANNEL_3;
+constexpr ledc_channel_t CH_NECK_UP = LEDC_CHANNEL_2;
+constexpr ledc_channel_t CH_NECK_DN = LEDC_CHANNEL_3;
 
 /* ─── App parameters ──────────────────────────────────────────── */
 
@@ -74,15 +80,32 @@ struct SensorData
     pitch;
   };
 
+enum Command { UNKNOWN=0, Q1, Q2, Q3, Q4 };
+
 
 /* ───── RTOS objects ────────────────────────────────────────────── */
 static SemaphoreHandle_t i2cMutex;
+static SemaphoreHandle_t sdMutex;
 static QueueHandle_t sensorQueueBack;
 static QueueHandle_t sensorQueueNeck;
+static QueueHandle_t cmdLineQueue;           // holds char* lines
+static QueueHandle_t sensorQueueCmd = nullptr;
+static constexpr size_t MAX_CMD_LINE = 32;   // max length of one command
 
 /* ───── MPU handles ─────────────────────────────────────────────── */
 static mpu6050_handle_t imu_back = nullptr;
 static mpu6050_handle_t imu_neck = nullptr;
+
+static TaskHandle_t imuBackHandle = nullptr;
+static TaskHandle_t imuNeckHandle = nullptr;
+static TaskHandle_t telemetryHandle = nullptr;
+
+
+/* ───── SD card pins ──────────────────────────────────────────── */
+static constexpr int SD_CS   = 5;
+static constexpr int SD_MOSI = 19;
+static constexpr int SD_MISO = 21;
+static constexpr int SD_CLK  = 27;
 
 /* ───── forward declarations ────────────────────────────────────── */
 static void i2c_init(void);
@@ -139,7 +162,7 @@ void init_bluedroid() {
 
 void init_gap() {
     // set the Bluetooth “friendly” name
-    ESP_ERROR_CHECK( esp_bt_dev_set_device_name(DEVICE_NAME) );
+    ESP_ERROR_CHECK(esp_bt_gap_set_device_name(DEVICE_NAME));
 
     // allow others to find & connect
     ESP_ERROR_CHECK( esp_bt_gap_set_scan_mode(
@@ -182,14 +205,14 @@ static esp_err_t imu_init()
 static void ledc_init()
 {
     /* timer */
-    ledc_timer_config_t t{
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = 5000,
-        .clk_cfg         = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&t));
+    ledc_timer_config_t timer_cfg{};
+    timer_cfg.speed_mode      = LEDC_LOW_SPEED_MODE;
+    timer_cfg.duty_resolution = LEDC_TIMER_8_BIT;
+    timer_cfg.timer_num       = LEDC_TIMER_0;
+    timer_cfg.freq_hz         = 5000; // 5 kHz
+    timer_cfg.clk_cfg         = LEDC_AUTO_CLK;
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
 
     /* helper to fill the channel struct */
     auto make_ch = [&](int pin, ledc_channel_t ch) {
@@ -207,8 +230,8 @@ static void ledc_init()
     /* create *named* structs so we have l‑values */
     ledc_channel_config_t chL = make_ch(BACK_L_PWM, CH_BACK_L);
     ledc_channel_config_t chR = make_ch(BACK_R_PWM, CH_BACK_R);
-    ledc_channel_config_t chUp  = make_ch(NECK_UP_PWM, CH_NECK_L);
-    ledc_channel_config_t chDn  = make_ch(NECK_DN_PWM, CH_NECK_R);
+    ledc_channel_config_t chUp  = make_ch(NECK_UP_PWM, CH_NECK_UP);
+    ledc_channel_config_t chDn  = make_ch(NECK_DN_PWM, CH_NECK_DN);
 
     ESP_ERROR_CHECK(ledc_channel_config(&chL));
     ESP_ERROR_CHECK(ledc_channel_config(&chR));
@@ -227,91 +250,109 @@ static inline void acce_to_angles(const mpu6050_acce_value_t& a,
 }
 
 /* ---------- Back IMU task ---------- */
-static void taskIMUBack(void*)
-{
-    SensorData d{};
-    mpu6050_acce_value_t a;
-
-    for (;;)
-    {
-        if (mpu6050_get_acce(imu_back, &a) == ESP_OK) {
-            acce_to_angles(a, d.roll, d.pitch);
-            xQueueSend(sensorQueueBack, &d, 0);
-
-            /* --- drive motors --- */
-            if      (d.roll >  TH_ROLL) {
+static void taskIMUBack(void* pv) {
+    mpu6050_acce_value_t a; float roll,pitch; uint32_t cmd;
+    for (;;) {
+        ESP_LOGI("BACK", "taskIMUBack alive");
+        // 1) command override?
+        if (xTaskNotifyWait(0, UINT32_MAX, &cmd, 0) == pdPASS) {
+            // Q3 = right, Q4 = left
+            if (cmd == Q3) {
                 ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
                 ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-            }
-            else if (d.roll < -TH_ROLL) {
+            } else {
                 ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
                 ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
             }
-            else {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-            }
+            // 1s vibration
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            // Turn both off
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+            continue;
+        }
 
-            ESP_LOGI("BACK","Roll %+6.1f  Pitch %+6.1f", d.roll, d.pitch);
+        // 2) normal IMU read & threshold
+        xSemaphoreTake(i2cMutex, portMAX_DELAY);
+        mpu6050_get_acce(imu_back, &a);
+        xSemaphoreGive(i2cMutex);
+        acce_to_angles(a, roll, pitch);
+        SensorData dat{roll, pitch};
+        xQueueSend(sensorQueueBack, &dat, portMAX_DELAY);
+
+        if      (roll >  TH_ROLL) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+        } else if (roll < -TH_ROLL) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+        } else {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
         }
-        else {
-            ESP_LOGE("BACK","I2C read fail");
-        }
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
+
+        vTaskDelay(SAMPLE_MS);
     }
 }
 
+
 /* ---------- Neck IMU task ---------- */
-/* ---------- Neck IMU task with thresholding ---------- */
-static void taskIMUNeck(void*)
-{
-    if (!imu_neck) {
-        ESP_LOGW("NECK","No handle – task suspended");
-        vTaskDelete(nullptr);
-    }
 
-    SensorData d{};
-    mpu6050_acce_value_t a;
-
-    for (;;)
-    {
-        if (mpu6050_get_acce(imu_neck, &a) == ESP_OK) {
-
-            acce_to_angles(a, d.roll, d.pitch);
-            xQueueSend(sensorQueueNeck, &d, 0);
-
-            /* ---- pitch‑based motor drive ---- */
-            if      (d.pitch >  TH_PITCH) {   // tip head UP
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
+static void taskIMUNeck(void* pv) {
+    mpu6050_acce_value_t a; float roll,pitch; uint32_t cmd;
+    for (;;) {
+        ESP_LOGI("Neck", "taskIMUNeck alive");
+        if (xTaskNotifyWait(0, UINT32_MAX, &cmd, 0) == pdPASS) {
+            // Q1 = up, Q2 = down
+            if (cmd == Q1) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            } else {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
             }
-            else if (d.pitch < -TH_PITCH) {   // tip head DOWN
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
-            }
-            else {                            // within dead‑band
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L, 0);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_L);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_R);
-            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
 
-            ESP_LOGI("NECK","Roll %+6.1f  Pitch %+6.1f", d.roll, d.pitch);
-
-        } else {
-            ESP_LOGE("NECK","I2C read fail");
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
+
+        xSemaphoreTake(i2cMutex, portMAX_DELAY);
+        mpu6050_get_acce(imu_neck, &a);
+        xSemaphoreGive(i2cMutex);
+        acce_to_angles(a, roll, pitch);
+        SensorData dat{roll, pitch};
+        xQueueSend(sensorQueueNeck, &dat, 0);
+
+        if      (pitch >  TH_PITCH) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+        } else if (pitch < -TH_PITCH) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+        } else {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+        }
+
+        vTaskDelay(SAMPLE_MS);
     }
 }
 
@@ -323,12 +364,15 @@ void taskTelemetry(void* pv) {
     char       buf[64];
 
     for (;;) {
+        ESP_LOGI("TEL", "taskTelemetry alive");
         // pull fresh data if available
-        if (xQueueReceive(sensorQueueBack, &back, 0) == pdPASS) {
+        if (xQueueReceive(sensorQueueBack, &back, portMAX_DELAY) == pdPASS) {
             backRoll = back.roll;
+            ESP_LOGI("TEL","Back → Roll %.1f, Pitch %.1f", back.roll, back.pitch);
         }
         if (xQueueReceive(sensorQueueNeck, &top, 0) == pdPASS) {
             neckPitch = top.pitch;
+            ESP_LOGI("TEL","Neck → Roll %.1f, Pitch %.1f", top.roll, top.pitch);
         }
 
         // only stream once we have both numbers
@@ -360,11 +404,68 @@ void taskTelemetry(void* pv) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+
+static void taskCommand(void* pv) {
+    char buf[MAX_CMD_LINE];
+    for (;;) {
+        if (xQueueReceive(cmdLineQueue, buf, portMAX_DELAY) == pdPASS) {
+            char* s = buf;
+            while (*s == ' ') ++s;
+
+            // REBOOT
+            if (strcasecmp(s, "REBOOT") == 0) {
+                const char* msg = "Rebooting now...\n";
+                if (client_handle) {
+                    esp_spp_write(client_handle,
+                                  strlen(msg),
+                                  (uint8_t*)msg);
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                esp_restart();
+            }
+
+            // parse command
+            Command c = UNKNOWN;           // ← fixed assignment
+            if      (strcmp(s, "Q1") == 0) c = Q1;
+            else if (strcmp(s, "Q2") == 0) c = Q2;
+            else if (strcmp(s, "Q3") == 0) c = Q3;
+            else if (strcmp(s, "Q4") == 0) c = Q4;
+
+            if (c != UNKNOWN) {
+                // blink LED
+                gpio_set_level(GPIO_NUM_13, 1);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                gpio_set_level(GPIO_NUM_13, 0);
+
+                // notify tasks
+                if (c == Q1 || c == Q2) {
+                    xTaskNotify(imuNeckHandle,
+                                (uint32_t)c,
+                                eSetValueWithOverwrite);
+                } else {
+                    xTaskNotify(imuBackHandle,
+                                (uint32_t)c,
+                                eSetValueWithOverwrite);
+                }
+
+                // store history if needed
+                if (sensorQueueCmd) {
+                    xQueueSend(sensorQueueCmd, &c, portMAX_DELAY);
+                }
+            }
+        }
+    }
+}
+
+
 // ============================= Bluetooth SPP callback =============================
 // This function is called by the SPP stack when events occur
 extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
                            esp_spp_cb_param_t *param)
 {
+
+    static char lineBuf[MAX_CMD_LINE];
+    static size_t idx = 0;
     switch (event) {
 
         case ESP_SPP_INIT_EVT:
@@ -397,17 +498,30 @@ extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
             client_handle = 0;
             break;
 
-        case ESP_SPP_DATA_IND_EVT:
-            // Data received from the client
-            ESP_LOGI(SPP_TAG,
-                     "Received %d bytes on handle=%" PRIu32,
-                     param->data_ind.len,
-                     param->data_ind.handle);
-            // Example: echo back what we got
-            esp_spp_write(param->data_ind.handle,
-                          param->data_ind.len,
-                          param->data_ind.data);
+        case ESP_SPP_DATA_IND_EVT: {
+            ESP_LOGI(SPP_TAG, "SPP_DATA_IND_EVT: %d bytes", param->data_ind.len);
+            for (int i = 0; i < param->data_ind.len; ++i) {
+                char c = param->data_ind.data[i];
+                if (c == '\r') continue;
+                if (c == '\n' || idx + 1 >= MAX_CMD_LINE) {
+                    lineBuf[idx] = '\0';
+                    ESP_LOGI(SPP_TAG, "Complete command line: '%s'", lineBuf);
+                    if (cmdLineQueue) {
+                        if (xQueueSend(cmdLineQueue, lineBuf, 0) == pdPASS) {
+                            ESP_LOGI(SPP_TAG, "Enqueued command line");
+                        } else {
+                            ESP_LOGW(SPP_TAG, "Failed to enqueue command line");
+                        }
+                    }
+                    idx = 0;
+                } else {
+                    lineBuf[idx++] = c;
+                }
+            }
             break;
+        }
+
+
 
         case ESP_SPP_CONG_EVT:
             // Congestion status changed (flow-control)
@@ -429,20 +543,20 @@ extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
 /* ───── app_main ───────────────────────────────────────────────── */
 extern "C" void app_main(void)
 {
-
-
     init_nvs();
     init_bt_controller();
     init_bluedroid();
     init_gap();
+
+
+    i2cMutex = xSemaphoreCreateMutex();
+    sdMutex = xSemaphoreCreateMutex();
+    sensorQueueBack = xQueueCreate(20, sizeof(SensorData));
+    sensorQueueNeck = xQueueCreate(20, sizeof(SensorData));
+    sensorQueueCmd = xQueueCreate(10, sizeof(Command));
+    cmdLineQueue = xQueueCreate(10, MAX_CMD_LINE);
+
     init_spp();
-
-
-    i2cMutex        = xSemaphoreCreateMutex();
-    // sdMutex         = xSemaphoreCreateMutex();
-    sensorQueueBack = xQueueCreate(10, sizeof(SensorData));
-    sensorQueueNeck = xQueueCreate(10, sizeof(SensorData));
-
     i2c_init();
     ledc_init();
     if (imu_init() != ESP_OK) {
@@ -450,9 +564,14 @@ extern "C" void app_main(void)
         return;
     }
 
-    xTaskCreate(taskIMUBack, "IMU Back", 4096, nullptr, 2, nullptr);
-    xTaskCreate(taskIMUNeck, "IMU Neck", 4096, nullptr, 2, nullptr);
-    xTaskCreate(taskTelemetry, "Telemetry",    4096, nullptr, 5, nullptr);
+    xTaskCreate(taskIMUBack, "IMU Back", 4096, nullptr, 2, &imuBackHandle);
+    xTaskCreate(taskIMUNeck, "IMU Neck", 4096, nullptr, 2, &imuNeckHandle);
+    xTaskCreate(taskTelemetry, "Telemetry",    4096, nullptr, 3, &telemetryHandle);
+    xTaskCreate(taskCommand, "Command", 4096, nullptr, 4, nullptr);
+
+    gpio_reset_pin(GPIO_NUM_13);
+    gpio_set_direction(GPIO_NUM_13, GPIO_MODE_OUTPUT);
+
 
     ESP_LOGI("MAIN","Both IMU tasks started");
 }
