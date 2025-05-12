@@ -84,6 +84,8 @@ struct SensorData
   };
 
 enum Command { UNKNOWN=0, Q1, Q2, Q3, Q4 };
+static Command active_cmd = UNKNOWN;
+static const char *TAG = "CMD";
 
 
 /* ───── RTOS objects ────────────────────────────────────────────── */
@@ -300,93 +302,106 @@ static inline void acce_to_angles(const mpu6050_acce_value_t& a,
 
 
 // Real Time tasks
-static void hard_rt_task(void* pv) {
-    mpu6050_acce_value_t a;
-    float roll, pitch;
-    uint32_t cmd;
+// ==================== Hard Real-Time task (full replacement) ====================
+// -----------------------------------------------------------------------------
+// This runs at 1 kHz on the RT core.
+// -----------------------------------------------------------------------------
+static void hard_rt_task(void* /*param*/) {
+    TickType_t lastWake = xTaskGetTickCount();
+    Command active_cmd = UNKNOWN;
 
-    for (;;) {
-        // 1) Wait for the 1 kHz ISR to notify us
+    while (true) {
+        // 1) wait for our 1 ms tick (unblocks once per millisecond)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // 2) Handle any override command
-        if (xTaskNotifyWait(0, UINT32_MAX, &cmd, 0) == pdPASS) {
-            switch (cmd) {
-                case Q1:
-                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
-                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-                    break;
-                case Q2:
-                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
-                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-                    break;
-                case Q3:
-                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
-                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-                    break;
-                case Q4:
-                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
-                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-                    break;
-                default:
-                    break;
+        // 2) if there’s an override pending, do it
+        if (active_cmd != UNKNOWN) {
+            // drive the commanded channel
+            switch (active_cmd) {
+                case Q1: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);   break;
+                case Q2: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);   break;
+                case Q3: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R,  PWM_DUTY);   break;
+                case Q4: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L,  PWM_DUTY);   break;
+                default: break;
             }
+            // commit all four channels
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
 
-            // turn off after pulse
-            if (cmd == Q1 || cmd == Q2) {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-            } else {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-            }
+            // **still collect IMU for telemetry!**
+            mpu6050_acce_value_t  a;
+            float roll, pitch;
 
-            // done for this tick—loop back and block on the next ISR
+            xSemaphoreTake(i2cMutex, portMAX_DELAY);
+              mpu6050_get_acce(imu_back, &a);
+            xSemaphoreGive(i2cMutex);
+            acce_to_angles(a, roll, pitch);
+            xQueueSendToFront(sensorQueueBack,    &roll, 0);
+
+            xSemaphoreTake(i2cMutex, portMAX_DELAY);
+              mpu6050_get_acce(imu_neck, &a);
+            xSemaphoreGive(i2cMutex);
+            acce_to_angles(a, roll, pitch);
+            xQueueSendToFront(sensorQueueNeck,    &pitch, 0);
+
+            // Done for this tick; wait for next millisecond
             continue;
         }
 
-        // 3) Normal Back IMU
-        xSemaphoreTake(i2cMutex, portMAX_DELAY);
-          mpu6050_get_acce(imu_back, &a);
-        xSemaphoreGive(i2cMutex);
-        acce_to_angles(a, roll, pitch);
-        SensorData datBack{roll, pitch};
-        xQueueSend(sensorQueueBack, &datBack, portMAX_DELAY);
-
-        if      (roll >  TH_ROLL) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
-        else if (roll < -TH_ROLL) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
-        else {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
+        // 3) no override pending & we used to have one?  (i.e. we got a STOP)
+        //    Only clear if active_cmd was just set to UNKNOWN in taskCommand.
+        //    Here, just zero out any channel that’s still on.
+        //    (This block only runs once, right after a STOP.)
+        if (active_cmd != UNKNOWN) {
+            switch (active_cmd) {
+                case Q1: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0); break;
+                case Q2: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0); break;
+                case Q3: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R,  0); break;
+                case Q4: ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L,  0); break;
+                default: break;
+            }
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+            // active_cmd is already UNKNOWN; we just clear the motors once
         }
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
 
-        // 4) Normal Neck IMU
-        xSemaphoreTake(i2cMutex, portMAX_DELAY);
-          mpu6050_get_acce(imu_neck, &a);
-        xSemaphoreGive(i2cMutex);
-        acce_to_angles(a, roll, pitch);
-        SensorData datNeck{roll, pitch};
-        xQueueSend(sensorQueueNeck, &datNeck, 0);
+        // 4) normal IMU‐based drive (this also still enqueues telemetry)
+        {
+          mpu6050_acce_value_t  a;
+          float roll, pitch;
 
-        if      (pitch >  TH_PITCH) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
-        else if (pitch < -TH_PITCH) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
-        else {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+          // back
+          xSemaphoreTake(i2cMutex, portMAX_DELAY);
+            mpu6050_get_acce(imu_back, &a);
+          xSemaphoreGive(i2cMutex);
+          acce_to_angles(a, roll, pitch);
+          if      (roll  > TH_ROLL)  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
+          else if (roll  < -TH_ROLL) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
+          else                      { ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
+                                      ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0); }
+          ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+          ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+          xQueueSendToFront(sensorQueueBack, &roll, 0);
+
+          // neck
+          xSemaphoreTake(i2cMutex, portMAX_DELAY);
+            mpu6050_get_acce(imu_neck, &a);
+          xSemaphoreGive(i2cMutex);
+          acce_to_angles(a, roll, pitch);
+          if      (pitch > TH_PITCH)  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
+          else if (pitch < -TH_PITCH) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
+          else                       { ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+                                     ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0); }
+          ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+          ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+          xQueueSendToFront(sensorQueueNeck, &pitch, 0);
         }
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-
-        
     }
 }
-
 
 
 /* ---------- Neck IMU task ---------- */
@@ -439,58 +454,38 @@ void taskTelemetry(void* pv) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+static void taskCommand(void *pvParameter)
+{
+    char buf[MAX_CMD_LINE];  // 32
 
-static void taskCommand(void* pv) {
-    char buf[MAX_CMD_LINE];
     for (;;) {
-        if (xQueueReceive(cmdLineQueue, buf, portMAX_DELAY) == pdPASS) {
-            char* s = buf;
-            while (*s == ' ') ++s;
+        // 1) wait indefinitely for a complete line
+        if (xQueueReceive(cmdLineQueue, buf, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "Got command: '%s'", buf);
 
-            // REBOOT
-            if (strcasecmp(s, "REBOOT") == 0) {
-                const char* msg = "Rebooting now...\n";
-                if (client_handle) {
-                    esp_spp_write(client_handle,
-                                  strlen(msg),
-                                  (uint8_t*)msg);
-                }
-                vTaskDelay(pdMS_TO_TICKS(50));
-                esp_restart();
+            // 2) parse it
+            if      (strncmp(buf, "Q1",   2) == 0) active_cmd = Q1;
+            else if (strncmp(buf, "Q2",   2) == 0) active_cmd = Q2;
+            else if (strncmp(buf, "Q3",   2) == 0) active_cmd = Q3;
+            else if (strncmp(buf, "Q4",   2) == 0) active_cmd = Q4;
+            else if (strncmp(buf, "STOP", 4) == 0) active_cmd = UNKNOWN;
+            else {
+                ESP_LOGW(TAG, "Unknown command");
+                continue;  // don't notify RT task
             }
 
-            // parse command
-            Command c = UNKNOWN;           // ← fixed assignment
-            if      (strcmp(s, "Q1") == 0) c = Q1;
-            else if (strcmp(s, "Q2") == 0) c = Q2;
-            else if (strcmp(s, "Q3") == 0) c = Q3;
-            else if (strcmp(s, "Q4") == 0) c = Q4;
+            ESP_LOGI(TAG, "Setting active_cmd = %s",
+                     active_cmd==UNKNOWN ? "STOP" :
+                     active_cmd==Q1      ? "Q1"   :
+                     active_cmd==Q2      ? "Q2"   :
+                     active_cmd==Q3      ? "Q3"   : "Q4");
 
-            if (c != UNKNOWN) {
-                // blink LED
-                gpio_set_level(GPIO_NUM_13, 1);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                gpio_set_level(GPIO_NUM_13, 0);
-
-                // notify tasks
-                if (c == Q1 || c == Q2) {
-                    xTaskNotify(hard_rt_task_handle,
-                                (uint32_t)c,
-                                eSetValueWithOverwrite);
-                } else {
-                    xTaskNotify(hard_rt_task_handle,
-                                (uint32_t)c,
-                                eSetValueWithOverwrite);
-                }
-
-                // store history if needed
-                if (sensorQueueCmd) {
-                    xQueueSend(sensorQueueCmd, &c, portMAX_DELAY);
-                }
-            }
+            // 3) wake up the hard-RT task immediately
+            xTaskNotifyGive(hard_rt_task_handle);
         }
     }
 }
+
 
 
 // ============================= Bluetooth SPP callback =============================
@@ -542,7 +537,7 @@ extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
                     lineBuf[idx] = '\0';
                     ESP_LOGI(SPP_TAG, "Complete command line: '%s'", lineBuf);
                     if (cmdLineQueue) {
-                        if (xQueueSend(cmdLineQueue, lineBuf, 0) == pdPASS) {
+                        if (xQueueSendToFront(cmdLineQueue, lineBuf,0) == pdPASS) {
                             ESP_LOGI(SPP_TAG, "Enqueued command line");
                         } else {
                             ESP_LOGW(SPP_TAG, "Failed to enqueue command line");
@@ -559,7 +554,6 @@ extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
 
 
         case ESP_SPP_CONG_EVT:
-            // Congestion status changed (flow-control)
             if (param->cong.cong) {
                 ESP_LOGW(SPP_TAG, "SPP congested on handle=%" PRIu32,
                          param->cong.handle);
@@ -587,8 +581,8 @@ extern "C" void app_main() {
   sdMutex          = xSemaphoreCreateMutex();
   sensorQueueBack  = xQueueCreate(20, sizeof(SensorData));
   sensorQueueNeck  = xQueueCreate(20, sizeof(SensorData));
-  cmdLineQueue     = xQueueCreate(10, MAX_CMD_LINE);
-  sensorQueueCmd   = xQueueCreate(10, sizeof(Command));
+  cmdLineQueue     = xQueueCreate(20, MAX_CMD_LINE);
+  sensorQueueCmd   = xQueueCreate(20, sizeof(Command));
 
   init_spp();
   i2c_init();
@@ -603,7 +597,7 @@ extern "C" void app_main() {
       nullptr,
       configMAX_PRIORITIES - 1,
       &hard_rt_task_handle,
-      0
+      1
   );
 
   init_hardware_timer();
@@ -611,9 +605,9 @@ extern "C" void app_main() {
 
   // 2) Telemetry + Command on core 1
   xTaskCreatePinnedToCore(taskTelemetry, "Telemetry", 4096, nullptr,
-                          tskIDLE_PRIORITY+1, &telemetryHandle, 1);
+                          tskIDLE_PRIORITY+1, &telemetryHandle, 0);
   xTaskCreatePinnedToCore(taskCommand,   "Command",   4096, nullptr,
-                          tskIDLE_PRIORITY+1, nullptr,            1);
+                          tskIDLE_PRIORITY+2, nullptr,            0);
 
   // GPIO for feedback
   gpio_reset_pin(GPIO_NUM_13);
