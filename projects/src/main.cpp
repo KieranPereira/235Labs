@@ -559,5 +559,3 @@ void taskCommand(void* pv) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
-
-
