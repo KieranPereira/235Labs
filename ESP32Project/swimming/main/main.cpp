@@ -13,6 +13,7 @@
 #include "driver/i2c.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
+#include "driver/timer.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -33,13 +34,15 @@
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
 #include "esp_timer.h"
-
+#include "esp_intr_alloc.h"
 
 #include <cmath>
 
 extern "C" {
 #include "mpu6050.h"
 }
+
+
 
 /* ───── I²C pins ──────────────────────────────────────────────── */
 constexpr gpio_num_t SDA_PIN = GPIO_NUM_22;
@@ -96,9 +99,9 @@ static constexpr size_t MAX_CMD_LINE = 32;   // max length of one command
 static mpu6050_handle_t imu_back = nullptr;
 static mpu6050_handle_t imu_neck = nullptr;
 
-static TaskHandle_t imuBackHandle = nullptr;
-static TaskHandle_t imuNeckHandle = nullptr;
+
 static TaskHandle_t telemetryHandle = nullptr;
+static TaskHandle_t hard_rt_task_handle = nullptr;
 
 
 /* ───── SD card pins ──────────────────────────────────────────── */
@@ -111,8 +114,52 @@ static constexpr int SD_CLK  = 27;
 static void i2c_init(void);
 static esp_err_t imu_init(void);
 static void ledc_init(void);
-static void taskIMUBack(void* pv);
-static void taskIMUNeck(void* pv);
+
+
+// ============================= Hard Real-Time Definitions ===========================
+// 1a) ISR, marked IRAM_ATTR so it never stalls on flash
+void IRAM_ATTR timer_isr(void*){
+  timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
+  timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
+  BaseType_t awoken = pdFALSE;
+  vTaskNotifyGiveFromISR(hard_rt_task_handle, &awoken);
+  if (awoken) portYIELD_FROM_ISR();
+}
+
+// 1b) One-time timer setup, called from app_main()
+static void init_hardware_timer() {
+    // 1) Zero out the config struct
+    timer_config_t cfg = {};
+
+    // 2) Fill in all required fields
+    cfg.divider     = 80;                  // 80 MHz / 80 = 1 MHz → 1 µs tick
+    cfg.counter_dir = TIMER_COUNT_UP;      // count up
+    cfg.counter_en  = TIMER_PAUSE;         // start paused
+    cfg.alarm_en    = TIMER_ALARM_EN;      // enable alarm
+    cfg.auto_reload = TIMER_AUTORELOAD_EN;                // reload on alarm
+    cfg.intr_type   = TIMER_INTR_LEVEL;    // level interrupt
+    // (clk_src defaults to APB; if you need REF_TICK you can set cfg.clk_src)
+
+    // 3) Apply the config
+    timer_init(TIMER_GROUP_0, TIMER_0, &cfg);
+
+    // 4) Reset and set the alarm value
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
+    timer_set_alarm_value  (TIMER_GROUP_0, TIMER_0, 1000);  // 1 ms
+
+    // 5) Hook up and enable the ISR
+    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
+    timer_isr_register(
+      TIMER_GROUP_0, TIMER_0, timer_isr, nullptr,
+      ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL1,
+      nullptr
+    );
+
+    // 6) Finally kick the timer off
+    timer_start(TIMER_GROUP_0, TIMER_0);
+
+    ESP_LOGI("RT_TIMER", "Hardware timer configured at 1 kHz");
+}
 
 // ============================= Init Functions =============================
 
@@ -250,111 +297,99 @@ static inline void acce_to_angles(const mpu6050_acce_value_t& a,
 }
 
 /* ---------- Back IMU task ---------- */
-static void taskIMUBack(void* pv) {
-    mpu6050_acce_value_t a; float roll,pitch; uint32_t cmd;
+
+
+// Real Time tasks
+static void hard_rt_task(void* pv) {
+    mpu6050_acce_value_t a;
+    float roll, pitch;
+    uint32_t cmd;
+
     for (;;) {
-        ESP_LOGI("BACK", "taskIMUBack alive");
-        // 1) command override?
+        // 1) Wait for the 1 kHz ISR to notify us
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // 2) Handle any override command
         if (xTaskNotifyWait(0, UINT32_MAX, &cmd, 0) == pdPASS) {
-            // Q3 = right, Q4 = left
-            if (cmd == Q3) {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-            } else {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+            switch (cmd) {
+                case Q1:
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+                    break;
+                case Q2:
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+                    break;
+                case Q3:
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+                    break;
+                case Q4:
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+                    break;
+                default:
+                    break;
             }
-            // 1s vibration
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            // Turn both off
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+
+            // turn off after pulse
+            if (cmd == Q1 || cmd == Q2) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+            } else {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+            }
+
+            // done for this tick—loop back and block on the next ISR
             continue;
         }
 
-        // 2) normal IMU read & threshold
+        // 3) Normal Back IMU
         xSemaphoreTake(i2cMutex, portMAX_DELAY);
-        mpu6050_get_acce(imu_back, &a);
+          mpu6050_get_acce(imu_back, &a);
         xSemaphoreGive(i2cMutex);
         acce_to_angles(a, roll, pitch);
-        SensorData dat{roll, pitch};
-        xQueueSend(sensorQueueBack, &dat, portMAX_DELAY);
+        SensorData datBack{roll, pitch};
+        xQueueSend(sensorQueueBack, &datBack, portMAX_DELAY);
 
-        if      (roll >  TH_ROLL) {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
+        if      (roll >  TH_ROLL) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, PWM_DUTY);
+        else if (roll < -TH_ROLL) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
+        else {
             ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-        } else if (roll < -TH_ROLL) {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, PWM_DUTY);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
             ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
-        } else {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
         }
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_L);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BACK_R);
 
-        vTaskDelay(SAMPLE_MS);
+        // 4) Normal Neck IMU
+        xSemaphoreTake(i2cMutex, portMAX_DELAY);
+          mpu6050_get_acce(imu_neck, &a);
+        xSemaphoreGive(i2cMutex);
+        acce_to_angles(a, roll, pitch);
+        SensorData datNeck{roll, pitch};
+        xQueueSend(sensorQueueNeck, &datNeck, 0);
+
+        if      (pitch >  TH_PITCH) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
+        else if (pitch < -TH_PITCH) ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
+        else {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
+        }
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
+
+        
     }
 }
+
 
 
 /* ---------- Neck IMU task ---------- */
-
-static void taskIMUNeck(void* pv) {
-    mpu6050_acce_value_t a; float roll,pitch; uint32_t cmd;
-    for (;;) {
-        ESP_LOGI("Neck", "taskIMUNeck alive");
-        if (xTaskNotifyWait(0, UINT32_MAX, &cmd, 0) == pdPASS) {
-            // Q1 = up, Q2 = down
-            if (cmd == Q1) {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-            } else {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-            continue;
-        }
-
-        xSemaphoreTake(i2cMutex, portMAX_DELAY);
-        mpu6050_get_acce(imu_neck, &a);
-        xSemaphoreGive(i2cMutex);
-        acce_to_angles(a, roll, pitch);
-        SensorData dat{roll, pitch};
-        xQueueSend(sensorQueueNeck, &dat, 0);
-
-        if      (pitch >  TH_PITCH) {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, PWM_DUTY);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-        } else if (pitch < -TH_PITCH) {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, PWM_DUTY);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-        } else {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_UP);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_NECK_DN);
-        }
-
-        vTaskDelay(SAMPLE_MS);
-    }
-}
 
 // ==================== taskTelemetry (replace entire function) ====================
 void taskTelemetry(void* pv) {
@@ -439,11 +474,11 @@ static void taskCommand(void* pv) {
 
                 // notify tasks
                 if (c == Q1 || c == Q2) {
-                    xTaskNotify(imuNeckHandle,
+                    xTaskNotify(hard_rt_task_handle,
                                 (uint32_t)c,
                                 eSetValueWithOverwrite);
                 } else {
-                    xTaskNotify(imuBackHandle,
+                    xTaskNotify(hard_rt_task_handle,
                                 (uint32_t)c,
                                 eSetValueWithOverwrite);
                 }
@@ -541,37 +576,48 @@ extern "C" void esp_spp_cb(esp_spp_cb_event_t event,
 }
 
 /* ───── app_main ───────────────────────────────────────────────── */
-extern "C" void app_main(void)
-{
-    init_nvs();
-    init_bt_controller();
-    init_bluedroid();
-    init_gap();
+extern "C" void app_main() {
+  init_nvs();
+  init_bt_controller();
+  init_bluedroid();
+  init_gap();
 
 
-    i2cMutex = xSemaphoreCreateMutex();
-    sdMutex = xSemaphoreCreateMutex();
-    sensorQueueBack = xQueueCreate(20, sizeof(SensorData));
-    sensorQueueNeck = xQueueCreate(20, sizeof(SensorData));
-    sensorQueueCmd = xQueueCreate(10, sizeof(Command));
-    cmdLineQueue = xQueueCreate(10, MAX_CMD_LINE);
+  i2cMutex         = xSemaphoreCreateMutex();
+  sdMutex          = xSemaphoreCreateMutex();
+  sensorQueueBack  = xQueueCreate(20, sizeof(SensorData));
+  sensorQueueNeck  = xQueueCreate(20, sizeof(SensorData));
+  cmdLineQueue     = xQueueCreate(10, MAX_CMD_LINE);
+  sensorQueueCmd   = xQueueCreate(10, sizeof(Command));
 
-    init_spp();
-    i2c_init();
-    ledc_init();
-    if (imu_init() != ESP_OK) {
-        ESP_LOGE("MAIN","IMU init failed – check wiring.");
-        return;
-    }
+  init_spp();
+  i2c_init();
+  ledc_init();
+  ESP_ERROR_CHECK( imu_init() );
 
-    xTaskCreate(taskIMUBack, "IMU Back", 4096, nullptr, 2, &imuBackHandle);
-    xTaskCreate(taskIMUNeck, "IMU Neck", 4096, nullptr, 2, &imuNeckHandle);
-    xTaskCreate(taskTelemetry, "Telemetry",    4096, nullptr, 3, &telemetryHandle);
-    xTaskCreate(taskCommand, "Command", 4096, nullptr, 4, nullptr);
+  // 1) Hard real-time task on core 0
+  xTaskCreatePinnedToCore(
+      hard_rt_task,
+      "hard_rt",
+      4096,
+      nullptr,
+      configMAX_PRIORITIES - 1,
+      &hard_rt_task_handle,
+      0
+  );
 
-    gpio_reset_pin(GPIO_NUM_13);
-    gpio_set_direction(GPIO_NUM_13, GPIO_MODE_OUTPUT);
+  init_hardware_timer();
 
 
-    ESP_LOGI("MAIN","Both IMU tasks started");
+  // 2) Telemetry + Command on core 1
+  xTaskCreatePinnedToCore(taskTelemetry, "Telemetry", 4096, nullptr,
+                          tskIDLE_PRIORITY+1, &telemetryHandle, 1);
+  xTaskCreatePinnedToCore(taskCommand,   "Command",   4096, nullptr,
+                          tskIDLE_PRIORITY+1, nullptr,            1);
+
+  // GPIO for feedback
+  gpio_reset_pin(GPIO_NUM_13);
+  gpio_set_direction(GPIO_NUM_13, GPIO_MODE_OUTPUT);
+
+  ESP_LOGI("MAIN","Hard-RT and background tasks started");
 }
