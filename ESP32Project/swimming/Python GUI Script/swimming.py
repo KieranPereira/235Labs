@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ——— Configuration ———
-PORT               = "COM8"     # serial port for your ESP32
+PORT               = "COM9"     # serial port for your ESP32
 BAUD               = 115200     # your ESP32 baud rate
 ROLL_THRESHOLD     = 10         # tilt beyond which top zones light up
 PITCH_THRESHOLD    = 10         # tilt beyond which bottom zones light up
@@ -181,6 +181,7 @@ class HeatmapWidget(QWidget):
 
     def clearFlash(self):
         self.flash_section = None
+        self.serial_thread.sendCommand.emit(b'STOP\n')
         self.update()
 
     def paintEvent(self, event):

@@ -6,6 +6,8 @@ idf_component_register(
         freertos             # for tasks, queues, semaphores
         nvs_flash            # for init_nvs()
         bt   
+        mpu6050
+        esp_timer
 )
 
 # enable modern C++ for just this component
